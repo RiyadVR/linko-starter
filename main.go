@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -11,6 +14,30 @@ import (
 
 	"boot.dev/linko/internal/store"
 )
+
+type closeFunc func() error
+
+func initializeLogger() (*log.Logger, closeFunc, error) {
+	logFile := os.Getenv("LINKO_LOG_FILE")
+	if logFile == "" {
+		return log.New(os.Stderr, "", log.LstdFlags), func() error { return nil }, nil
+	}
+
+	f, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open log file: %w", err)
+	}
+	bw := bufio.NewWriterSize(f, 8192)
+	mw := io.MultiWriter(os.Stderr, bw)
+
+	closer := func() error {
+		if err := bw.Flush(); err != nil {
+			return err
+		}
+		return f.Close()
+	}
+	return log.New(mw, "", log.LstdFlags), closer, nil
+}
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -26,20 +53,23 @@ func main() {
 
 func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir string) int {
 
-	stdLogger := log.New(os.Stderr, "DEBUG: ", log.LstdFlags)
-	accesslog, err := os.OpenFile("linko.access.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	logger, closeLogger, err := initializeLogger()
 	if err != nil {
-		stdLogger.Printf("failed to open access log: %v\n", err)
+		log.Printf("%v", err)
 		return 1
 	}
-	accessLogger := log.New(accesslog, "INFO: ", log.LstdFlags)
+	defer func() {
+		if err := closeLogger(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to close logger: %v\n", err)
+		}
+	}()
 
-	st, err := store.New(dataDir, stdLogger)
+	st, err := store.New(dataDir, logger)
 	if err != nil {
-		stdLogger.Printf("failed to create store: %v", err)
+		logger.Printf("failed to create store: %v", err)
 		return 1
 	}
-	s := newServer(*st, httpPort, cancel, accessLogger)
+	s := newServer(*st, httpPort, cancel, logger)
 	var serverErr error
 	go func() {
 		serverErr = s.start()
@@ -50,11 +80,11 @@ func run(ctx context.Context, cancel context.CancelFunc, httpPort int, dataDir s
 	defer cancel()
 
 	if err := s.shutdown(shutdownCtx); err != nil {
-		stdLogger.Printf("failed to shutdown server: %v", err)
+		logger.Printf("failed to shutdown server: %v", err)
 		return 1
 	}
 	if serverErr != nil {
-		stdLogger.Printf("server error: %v", serverErr)
+		logger.Printf("server error: %v", serverErr)
 		return 1
 	}
 	return 0
